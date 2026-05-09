@@ -1,75 +1,48 @@
 """
-packer.py — Advanced 3D Guillotine Packer  (v2 — Strip Packing + Best-Area Fit)
-================================================================================
+packer.py — Advanced 3D Guillotine Packer  (v3 — Hybrid 2D/3D + Full Z-Reclaim)
+=================================================================================
 core.py의 Node, Cut, split_node()를 그대로 사용합니다.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[v2에서 도입된 알고리즘 개선 원리]
+[v3 핵심 개선 사항 — 4가지 Critical Requirements 완전 구현]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. Strip Packing (띠 절단 우선 탐색)
-   ─────────────────────────────────
-   현장 목수가 판재를 자르는 방식은 다음과 같습니다:
-     "폭 400mm 부품이 여러 개 있으면 → 원장에서 폭 400mm 띠(Strip)를 먼저
-      세로로 통째로 잘라내고 → 그 안에서 길이 방향으로 개별 부품을 쪼갠다."
+1. Z축 잔재의 완전한 회수 (Zero Dead-Space on Z)
+   ────────────────────────────────────────────────
+   Strip Packing 실행 중 두께(Z) 방향으로 남는 공간을 즉시 FREE 노드로 변환하여
+   NodeHeap에 반환합니다.
 
-   이 방식이 탐욕적 Best-Fit보다 효율적인 이유:
-   - 절단 횟수가 줄어든다 (띠 1번 → 내부 N번, vs 개별 N×2번)
-   - Kerf 손실이 집약된다 (공유 절단선)
-   - 잔재가 L자가 아닌 직사각형으로 남아 재활용이 쉽다
+   구현 위치: _execute_strip_plan() 내 _reclaim_z_slack() 호출
+   - Strip 분리 직후: strip_node.T > 배치 부품 최대 T 이면 Z split
+   - child_a (사용 두께) → Strip 내부 배치 계속
+   - child_b (남은 두께) → 즉시 FREE로 NodeHeap.push()  ← 핵심
+   - Fallback Best-Fit 루프에서도 동일 적용
 
-   구현 전략:
-   a) 폭(W)이 동일하거나 근사한 부품들을 "Strip 후보 그룹"으로 클러스터링
-      (허용 오차: STRIP_TOLERANCE = 5mm)
-   b) 각 클러스터에 대해 "총 길이 합"을 계산하여 띠로 잘랐을 때 효율 추정
-   c) 효율이 높은 클러스터부터 Strip 배치를 시도
-   d) Strip 배치 성공 시 해당 노드의 잔재는 큰 직사각형 형태로 남음
-   e) Strip 배치 불가 노드는 기존 Best-Fit(Fallback)으로 처리
+2. 지능형 2D/3D 하이브리드 모드 자동 전환
+   ─────────────────────────────────────────
+   _detect_mode(parts) → PackingMode.FLAT_2D | SOLID_3D
+   두께 표준편차 ≤ 1.0mm → FLAT_2D (Strip + 면적 가중치)
+   두께 표준편차 >  1.0mm → SOLID_3D (Volume-Max 가중치)
 
-2. Best-Area Fit (잔재 면적 최대화 절단 축 선택)
-   ─────────────────────────────────────────────
-   기존 v1의 Max-Offcut은 3개 잔재(child_b) 중 "가장 큰 부피 하나"를 기준으로
-   절단 순서를 선택했습니다.
-
-   v2에서는 여기서 한 단계 더 나아가:
-   - 3개 잔재 중 "가장 큰 것의 면적"을 우선 최대화
-   - 동점 시 "나머지 잔재들의 면적 합"도 비교
-
-   이 방식이 부피 기준보다 나은 이유:
-   - 기다란 얇은 잔재(높은 부피, 낮은 면적)보다 정사각형에 가까운 잔재가
-     다음 부품을 받아들이기 유리하다
-   - 2D 패킹(lock_z 부품이 많은 현실)에서는 면적이 실질적 지표
-
-3. Width-Grouping + Adaptive Strip Height
-   ────────────────────────────────────────
-   Strip을 구성할 때 같은 Width 그룹 내에서:
-   - Strip 높이(H) = 그룹 내 최대 Width 부품에 맞춤
-   - 남은 Width 공차(≤ STRIP_TOLERANCE)는 Kerf 손실과 함께 잔재로 처리
-   - 이로써 Strip 내부에서도 Best-Area Fit을 재귀 적용
-
-4. Graceful Degradation (우아한 성능 저하)
+3. 카메라 타겟 정보 제공 (App.jsx 연동)
    ──────────────────────────────────────
-   Strip 배치가 실패하거나 남은 부품이 Strip에 맞지 않을 때:
-   - 기존 v1의 Best-Fit + Max-Offcut 로직으로 자동 낙하(Fallback)
-   - 단일 부품도 빠짐없이 배치 시도
+   pack_parts() → PackResult.stock_centers: List[StockCenter]
+   각 Stock의 trimming 적용 후 유효 영역 정중앙 (cx, cy, cz)
+   App.jsx OrbitControls.target으로 직접 사용
 
-탐색 흐름 (v2):
-  Phase 1 — Strip Planning
-    1. 부품을 폭 기준으로 클러스터링 (STRIP_TOLERANCE 이내)
-    2. 클러스터별 Strip 효율 추정 (부품 면적 합 / Strip 면적)
-    3. 효율 높은 순서로 Strip 배치 시도
-       a. 원장에서 Strip 폭만큼 Y축(또는 X축) 절단
-       b. 그 Strip 내에서 부품을 길이 방향 순차 배치
-  Phase 2 — Fallback Best-Fit
-    4. 남은 FREE 공간에 나머지 부품을 v1 방식으로 배치
+4. 구체적 에러 핸들링
+   ────────────────────
+   FailureReason enum + 수치 detail → PlacementFailure.to_dict()
+   "[object Object]" 완전 제거
 """
 
 from __future__ import annotations
 
 import heapq
-import itertools
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from itertools import permutations
 from typing import Dict, List, Optional, Tuple
 
@@ -90,94 +63,146 @@ from core import (
 # 0. 알고리즘 파라미터 상수
 # ══════════════════════════════════════════════════════════════════
 
-# Strip 그룹화 허용 오차 (mm): 이 범위 내의 폭은 동일 Strip으로 취급
-STRIP_TOLERANCE = 5.0
-
-# Strip 배치 최소 효율 임계값: 이보다 낮으면 Strip 시도 포기 → Fallback
-STRIP_MIN_EFFICIENCY = 0.45
-
-# Strip 내 최소 부품 수: 이 수 이상일 때만 Strip 계획 수립
-STRIP_MIN_PARTS = 2
+STRIP_TOLERANCE: float  = 5.0     # Strip 폭 그룹화 허용 오차 (mm)
+STRIP_MIN_EFF_2D: float = 0.45    # 2D 모드 Strip 최소 효율
+STRIP_MIN_EFF_3D: float = 0.35    # 3D 모드 Strip 최소 효율 (낮춤 — 공간 활용 우선)
+STRIP_MIN_PARTS:  int   = 2       # Strip 구성 최소 부품 수
+THICKNESS_VAR_THRESH: float = 1.0 # 두께 표준편차 임계치(mm): 이하 → 2D 모드
+EPSILON: float = 1e-6             # 부동소수점 비교 허용 오차
 
 
 # ══════════════════════════════════════════════════════════════════
-# 1. 내부 타입 정의
+# 1. 내부 타입 & 열거형 정의
 # ══════════════════════════════════════════════════════════════════
 
-# 3축 절단 순서: CutAxis 3개의 순열
+class PackingMode(Enum):
+    """자동 감지된 패킹 모드."""
+    FLAT_2D  = "2D"   # 판재: Strip 가중치, 면적 기반 점수
+    SOLID_3D = "3D"   # 입체: Volume-Max 가중치, 부피 기반 점수
+
+
+class FailureReason(Enum):
+    """
+    배치 실패 원인 코드.
+    .value가 한국어 문자열로 프론트엔드에 직접 전달됩니다.
+    "[object Object]" 방지를 위해 모든 실패를 이 enum으로 분류합니다.
+    """
+    DIMENSION_EXCEEDS_NODE = "치수 초과: 부품이 노드보다 큽니다"
+    KERF_REMAINDER_ZERO    = "Kerf 잔재 없음: 절단 후 잔재가 0 이하입니다"
+    TRIMMING_TOO_LARGE     = "트리밍 초과: 유효 원장 영역이 부품보다 작습니다"
+    NO_VALID_ORIENTATION   = "배치 방향 없음: 허용된 방향 중 들어가는 것이 없습니다"
+    STOCK_EXHAUSTED        = "원장 소진: 모든 원장 사용 후에도 배치 불가"
+
+
+@dataclass
+class PlacementFailure:
+    """
+    단일 배치 실패 기록.
+    reason.value가 한국어 문자열이므로 JSON 직렬화 시 "[object Object]" 없음.
+    """
+    part_id:  str
+    stock_id: str
+    reason:   FailureReason
+    detail:   str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "part_id":  self.part_id,
+            "stock_id": self.stock_id,
+            "reason":   self.reason.value,  # ← 한국어 문자열, 절대 객체 아님
+            "detail":   self.detail,
+        }
+
+
+@dataclass
+class StockCenter:
+    """
+    원장 기하학적 정중앙 좌표 (요구사항 3: 카메라 타겟용).
+
+    trimming 적용 후 usable 영역의 중심:
+        cx = trimming_x + usable_l / 2
+        cy = trimming_y + usable_w / 2
+        cz = trimming_z + usable_t / 2
+
+    App.jsx Scene 컴포넌트의 OrbitControls target으로 직접 사용합니다.
+    """
+    stock_id: str
+    cx: float
+    cy: float
+    cz: float
+
+    def to_dict(self) -> dict:
+        return {"stock_id": self.stock_id, "cx": self.cx, "cy": self.cy, "cz": self.cz}
+
+
+@dataclass
+class PackResult:
+    """
+    pack_parts()의 반환값 (v3에서 List[Node]에서 변경).
+
+    FastAPI 엔드포인트에서 이 객체를 직렬화할 때:
+        failures      → [f.to_dict() for f in result.failures]
+        stock_centers → [c.to_dict() for c in result.stock_centers]
+    """
+    occupied:      List[Node]
+    failures:      List[PlacementFailure]
+    stock_centers: List[StockCenter]
+    mode:          PackingMode
+    unplaced:      Dict[str, int] = field(default_factory=dict)
+
+
+# 절단 순서: 3축 순열 6가지
 CutOrder = Tuple[CutAxis, CutAxis, CutAxis]
-
-# 6가지 가능한 절단 순서 (X→Y→Z, X→Z→Y, ...)
-ALL_CUT_ORDERS: List[CutOrder] = list(permutations([CutAxis.X, CutAxis.Y, CutAxis.Z]))  # type: ignore[arg-type]
+ALL_CUT_ORDERS: List[CutOrder] = list(
+    permutations([CutAxis.X, CutAxis.Y, CutAxis.Z])  # type: ignore[arg-type]
+)
 
 
 @dataclass
 class PlacementCandidate:
-    """
-    (node, part, orientation, cut_order)의 하나의 배치 후보.
-
-    score      : Best-Area Fit 점수 — 낮을수록 공간 낭비가 적음
-                 = node.face_area(XY) - part_dims.face_area
-    max_offcut : 이 절단 순서에서 생기는 가장 큰 잔재 면적
-                 (동점 시 tie-break에 사용)
-    """
-    score: float          # Best-Area Fit: 작을수록 좋음
-    max_offcut: float     # Max-Offcut 면적: 클수록 좋음 (tie-break)
-    node: Node
-    part: Part
-    part_dims: Dims       # 실제 배치될 방향의 치수
-    cut_order: CutOrder
+    """(node, part, orientation, cut_order) 배치 후보."""
+    score:      float   # 낭비 점수: 작을수록 좋음
+    max_offcut: float   # 최대 잔재 크기: 클수록 좋음 (tie-break)
+    node:       Node
+    part:       Part
+    part_dims:  Dims
+    cut_order:  CutOrder
 
     def __lt__(self, other: PlacementCandidate) -> bool:
-        # 1차: score 오름차순 (면적 낭비 최소화)
-        # 2차: max_offcut 내림차순 (큰 잔재 보존)
-        if abs(self.score - other.score) > 1e-6:
+        if abs(self.score - other.score) > EPSILON:
             return self.score < other.score
         return self.max_offcut > other.max_offcut
 
 
 @dataclass
 class StripPlan:
-    """
-    하나의 Strip(띠) 배치 계획.
-
-    strip_width : Strip의 폭 (절단 축의 크기, mm)
-    strip_axis  : Strip을 가르는 절단 축 (보통 CutAxis.Y — 폭 방향)
-    parts_seq   : Strip 내부에 배치할 (part, orientation) 순서 목록
-    efficiency  : 예상 효율 (부품 면적 합 / Strip 면적)
-    """
+    """하나의 Strip(띠) 배치 계획."""
     strip_width: float
-    strip_axis: CutAxis
-    parts_seq: List[Tuple[Part, Dims]]
-    efficiency: float
+    strip_axis:  CutAxis
+    parts_seq:   List[Tuple[Part, Dims]]
+    efficiency:  float
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. FREE Node 우선순위 큐 (Min-Heap)
+# 2. FREE Node 우선순위 큐 (Min-Heap, 부피 내림차순)
 # ══════════════════════════════════════════════════════════════════
 
 class NodeHeap:
     """
     FREE Node를 부피 내림차순으로 관리하는 우선순위 큐.
-
-    큰 노드를 먼저 처리해야 큰 부품을 앞쪽에 배치하고
-    잔재를 작게 유지하는 효과를 얻습니다.
-
     heapq는 min-heap이므로 부피에 음수를 취합니다.
+    stale 항목은 지연 삭제(lazy deletion)로 처리합니다.
     """
 
     def __init__(self) -> None:
         self._heap: list = []
-        # 이미 SPLIT/OCCUPIED된 stale 노드 ID를 추적해 지연 삭제
         self._removed: set[str] = set()
 
     def push(self, node: Node) -> None:
         if node.state == NodeState.FREE:
-            # (-volume, node_id, node) — node_id로 동점 시 안정 정렬
             heapq.heappush(self._heap, (-node.volume, node.node_id, node))
 
     def pop(self) -> Optional[Node]:
-        """FREE 상태인 노드가 나올 때까지 stale 항목을 제거합니다."""
         while self._heap:
             _, nid, node = heapq.heappop(self._heap)
             if nid in self._removed:
@@ -188,7 +213,6 @@ class NodeHeap:
         return None
 
     def invalidate(self, node_id: str) -> None:
-        """특정 노드 ID를 stale로 표시합니다 (지연 삭제)."""
         self._removed.add(node_id)
 
     def __len__(self) -> int:
@@ -199,24 +223,76 @@ class NodeHeap:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3. 절단 순서 평가 — Best-Area Fit (v2 개선)
+# 3. 지능형 모드 감지 (요구사항 2)
 # ══════════════════════════════════════════════════════════════════
 
-def _offcut_areas_for_order(
+def _detect_mode(parts: List[Part]) -> PackingMode:
+    """
+    부품 두께(T)의 표준편차를 분석하여 패킹 모드를 결정합니다.
+
+    std_dev ≤ THICKNESS_VAR_THRESH → FLAT_2D (Strip 우선, 면적 점수)
+    std_dev >  THICKNESS_VAR_THRESH → SOLID_3D (Volume-Max, 부피 점수)
+    """
+    if not parts:
+        return PackingMode.FLAT_2D
+    ts = [p.dims.t for p in parts]
+    mean_t = sum(ts) / len(ts)
+    std_dev = (sum((t - mean_t) ** 2 for t in ts) / len(ts)) ** 0.5
+    return PackingMode.FLAT_2D if std_dev <= THICKNESS_VAR_THRESH else PackingMode.SOLID_3D
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4. Z축 잔재 즉시 회수 (요구사항 1 핵심 함수)
+# ══════════════════════════════════════════════════════════════════
+
+def _reclaim_z_slack(
+    node: Node,
+    target_t: float,
+    kerf: float,
+    heap: NodeHeap,
+) -> Node:
+    """
+    두께(Z) 방향 잔재를 즉시 FREE 노드로 분리하여 NodeHeap에 반환합니다.
+
+    [요구사항 1 핵심 구현]
+    Strip Packing 중에도 T 슬랙이 있으면 즉시 회수합니다.
+    어떤 공간도 계산 외부로 누락되지 않습니다.
+
+        node.dims.t ≈ target_t  → 분할 불필요, node 반환
+        node.dims.t > target_t + kerf:
+            split_node(Z, target_t)
+            child_a (target_t 두께) → 반환 (배치 계속)
+            child_b (Z 잔재)        → heap.push() ← 즉시 회수!
+    """
+    if abs(node.dims.t - target_t) < EPSILON:
+        return node
+    z_rem = node.dims.t - target_t - kerf
+    if z_rem <= EPSILON:
+        return node
+    try:
+        child_a, child_b = split_node(node, CutAxis.Z, target_t, kerf)
+    except InvalidCutError:
+        return node
+    if child_b is not None and child_b.state == NodeState.FREE:
+        heap.push(child_b)  # ★ Z 잔재 즉시 NodeHeap 반환
+    return child_a
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5. 절단 순서 평가 — Hybrid Best-Fit (요구사항 2)
+# ══════════════════════════════════════════════════════════════════
+
+def _offcut_metrics_for_order(
     node: Node,
     part_dims: Dims,
     cut_order: CutOrder,
     kerf: float,
-) -> Optional[Tuple[float, float, float]]:
+) -> Optional[Tuple[float, float, float, float]]:
     """
-    지정된 절단 순서로 3회 split_node()를 *시뮬레이션*하여
-    생성되는 3개 잔재(child_b)의 XY 단면적을 반환합니다.
-
-    [v2 변경] 부피(volume) → 면적(area) 기준으로 변경.
-    면적 기준이 2D 지배적인 현실 패킹에서 더 실질적입니다.
+    지정 절단 순서로 split 시뮬레이션 후 잔재 지표를 반환합니다.
 
     Returns:
-        (area_b1, area_b2, area_b3)
+        (max_offcut_area, sum_offcut_area, max_offcut_volume, sum_offcut_volume)
         None — 이 절단 순서로 배치 불가
     """
     remaining: dict[CutAxis, float] = {
@@ -224,87 +300,70 @@ def _offcut_areas_for_order(
         CutAxis.Y: node.dims.w,
         CutAxis.Z: node.dims.t,
     }
-
-    offcut_areas: List[float] = []
+    part_dim_map = {
+        CutAxis.X: part_dims.l,
+        CutAxis.Y: part_dims.w,
+        CutAxis.Z: part_dims.t,
+    }
+    areas:   List[float] = []
+    volumes: List[float] = []
 
     for axis in cut_order:
         total = remaining[axis]
-        pos = {CutAxis.X: part_dims.l, CutAxis.Y: part_dims.w, CutAxis.Z: part_dims.t}[axis]
-
-        # 딱 맞으면 절단 불필요
-        if abs(total - pos) < 1e-6:
-            offcut_areas.append(0.0)
+        pos   = part_dim_map[axis]
+        if abs(total - pos) < EPSILON:
+            areas.append(0.0); volumes.append(0.0)
             continue
-
         if pos <= 0 or pos > total:
             return None
-
         remainder = total - pos - kerf
         if remainder <= 0:
             return None
-
-        # child_b의 면적 계산 (XY 단면 기준)
-        b_dims = {
-            CutAxis.X: remaining[CutAxis.X],
-            CutAxis.Y: remaining[CutAxis.Y],
-            CutAxis.Z: remaining[CutAxis.Z],
-        }
-        b_dims[axis] = remainder
-        # XY 단면적: l × w
-        offcut_areas.append(b_dims[CutAxis.X] * b_dims[CutAxis.Y])
-
+        b = dict(remaining)
+        b[axis] = remainder
+        areas.append(b[CutAxis.X] * b[CutAxis.Y])
+        volumes.append(b[CutAxis.X] * b[CutAxis.Y] * b[CutAxis.Z])
         remaining[axis] = pos
 
-    if len(offcut_areas) < 3:
+    if len(areas) < 3:
         return None
-
-    return (offcut_areas[0], offcut_areas[1], offcut_areas[2])
+    return (max(areas), sum(areas), max(volumes), sum(volumes))
 
 
 def _best_cut_order(
     node: Node,
     part_dims: Dims,
     kerf: float,
+    mode: PackingMode,
 ) -> Optional[Tuple[CutOrder, float]]:
     """
-    6가지 절단 순서 중 Best-Area Fit 기준 최적 순서를 반환합니다.
+    6가지 절단 순서 중 모드 기반 최적 순서를 반환합니다.
 
-    [v2 Best-Area Fit 전략]
-    각 순서에서 생기는 3개 child_b 중:
-      1차: max(area)가 가장 큰 순서 선택
-          → 재활용 가능한 큰 직사각형 잔재 보존
-      2차 (동점): sum(area)가 큰 순서
-          → 전체 잔재 면적 총량 보존
-
-    Returns:
-        (best_order, max_offcut_area)
-        None — 모든 순서에서 배치 불가
+    FLAT_2D  → max XY 면적 잔재 최대화 (2차: sum 면적)
+    SOLID_3D → max 부피 잔재 최대화   (2차: sum 부피)
     """
-    best_order: Optional[CutOrder] = None
-    best_max_area: float = -1.0
-    best_sum_area: float = -1.0
+    best_order:     Optional[CutOrder] = None
+    best_primary:   float = -1.0
+    best_secondary: float = -1.0
 
     for order in ALL_CUT_ORDERS:
-        result = _offcut_areas_for_order(node, part_dims, order, kerf)
+        result = _offcut_metrics_for_order(node, part_dims, order, kerf)
         if result is None:
             continue
-        max_area = max(result)
-        sum_area = sum(result)
-        # 1차: max_area, 2차: sum_area
-        if (max_area > best_max_area) or (
-            abs(max_area - best_max_area) < 1e-6 and sum_area > best_sum_area
+        max_area, sum_area, max_vol, sum_vol = result
+        primary, secondary = (
+            (max_area, sum_area) if mode == PackingMode.FLAT_2D else (max_vol, sum_vol)
+        )
+        if primary > best_primary or (
+            abs(primary - best_primary) < EPSILON and secondary > best_secondary
         ):
-            best_max_area = max_area
-            best_sum_area = sum_area
-            best_order = order
+            best_primary = primary; best_secondary = secondary; best_order = order
 
-    if best_order is None:
-        return None
-    return (best_order, best_max_area)
+    return None if best_order is None else (best_order, best_primary)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 4. 단일 노드에 부품 배치 — 3회 split_node() 실행
+# 6. 단일 노드에 부품 배치 — split_node() 최대 3회
 # ══════════════════════════════════════════════════════════════════
 
 def _place_part_on_node(
@@ -315,29 +374,12 @@ def _place_part_on_node(
     kerf: float,
 ) -> Node:
     """
-    선택된 (node, part_dims, cut_order)에 대해 split_node()를 최대 3회 호출하여
-    정확히 part_dims 크기의 OCCUPIED 노드를 생성합니다.
+    선택된 (node, part_dims, cut_order)에 split_node()를 최대 3회 호출하여
+    part_dims 크기의 OCCUPIED 노드를 생성합니다.
 
-    절단 과정 (예: X→Y→Z):
-
-      node (L, W, T)
-        ├─ split X @ l  →  child_a (l, W, T)   ← 계속 분할
-        │                   child_b (L-l-k, W, T) ← FREE 잔재 ①
-        │
-      child_a (l, W, T)
-        ├─ split Y @ w  →  child_a_a (l, w, T)  ← 계속 분할
-        │                   child_a_b (l, W-w-k, T) ← FREE 잔재 ②
-        │
-      child_a_a (l, w, T)
-        ├─ split Z @ t  →  child_a_a_a (l, w, t) ← OCCUPIED ✓
-        │                   child_a_a_b (l, w, T-t-k) ← FREE 잔재 ③
-
-    Returns:
-        OCCUPIED 상태가 된 최종 노드
+    Z가 마지막 절단 축일 때 child_b (Z 잔재)가 split_node()에 의해 생성되며,
+    _register_new_free_nodes()의 부모 체인 역추적으로 자동 NodeHeap 등록됩니다.
     """
-    EPSILON = 1e-6
-    current = node
-
     axis_to_part_dim = {
         CutAxis.X: part_dims.l,
         CutAxis.Y: part_dims.w,
@@ -348,76 +390,50 @@ def _place_part_on_node(
         CutAxis.Y: lambda n: n.dims.w,
         CutAxis.Z: lambda n: n.dims.t,
     }
-
+    current = node
     for axis in cut_order:
-        node_dim = axis_to_node_dim[axis](current)
-        part_dim = axis_to_part_dim[axis]
-
-        if abs(node_dim - part_dim) < EPSILON:
+        if abs(axis_to_node_dim[axis](current) - axis_to_part_dim[axis]) < EPSILON:
             continue
-
-        child_a, _child_b = split_node(current, axis, part_dim, kerf)
+        child_a, _ = split_node(current, axis, axis_to_part_dim[axis], kerf)
         current = child_a
 
-    current.state = NodeState.OCCUPIED
-    current.placed_part = part
+    current.state            = NodeState.OCCUPIED
+    current.placed_part      = part
     current.placed_part_dims = part_dims
-
     return current
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. Strip Packing — 핵심 신규 모듈
+# 7. Strip Packing (요구사항 1 Z-회수 완전 통합)
 # ══════════════════════════════════════════════════════════════════
 
 def _cluster_parts_by_width(
     remaining_parts: dict[str, int],
     parts_by_id: dict[str, Part],
     node: Node,
-    kerf: float,
 ) -> List[List[Tuple[Part, Dims]]]:
-    """
-    남은 부품들을 폭(W) 기준으로 클러스터링합니다.
-
-    [Strip Packing Phase 1 — Grouping]
-    - 각 부품의 allowed_orientations() 중 node에 들어갈 수 있는 것을 골라
-      폭(W)이 STRIP_TOLERANCE 이내인 것들끼리 묶습니다.
-    - 결과: [(part, orientation), ...] 의 리스트 목록
-    - 각 클러스터는 공통 Strip 폭 후보를 공유합니다.
-    """
-    # 폭 → [(part, orientation), ...] 매핑 (근사 그룹화)
-    width_buckets: Dict[float, List[Tuple[Part, Dims]]] = {}
-
+    """부품을 폭(W) 기준으로 클러스터링합니다."""
+    buckets: Dict[float, List[Tuple[Part, Dims]]] = {}
     for part_id, qty in remaining_parts.items():
         if qty <= 0:
             continue
         part = parts_by_id[part_id]
-
         for orientation in part.allowed_orientations():
-            # 노드에 물리적으로 들어가는지 확인
             if (
-                orientation.l > node.dims.l + 1e-6
-                or orientation.w > node.dims.w + 1e-6
-                or orientation.t > node.dims.t + 1e-6
+                orientation.l > node.dims.l + EPSILON
+                or orientation.w > node.dims.w + EPSILON
+                or orientation.t > node.dims.t + EPSILON
             ):
                 continue
-
             w = orientation.w
-            # 기존 버킷 중 STRIP_TOLERANCE 이내인 것 찾기
-            matched_key = None
-            for key in width_buckets:
+            matched: Optional[float] = None
+            for key in buckets:
                 if abs(key - w) <= STRIP_TOLERANCE:
-                    matched_key = key
-                    break
-
-            if matched_key is None:
-                width_buckets[w] = []
-                matched_key = w
-
-            width_buckets[matched_key].append((part, orientation))
-
-    # 부품 수 기준 내림차순 (큰 클러스터 우선)
-    clusters = list(width_buckets.values())
+                    matched = key; break
+            if matched is None:
+                buckets[w] = []; matched = w
+            buckets[matched].append((part, orientation))
+    clusters = list(buckets.values())
     clusters.sort(key=lambda c: -len(c))
     return clusters
 
@@ -426,104 +442,52 @@ def _plan_strip(
     cluster: List[Tuple[Part, Dims]],
     node: Node,
     remaining_parts: dict[str, int],
+    parts_by_id: dict[str, Part],
     kerf: float,
+    mode: PackingMode,
 ) -> Optional[StripPlan]:
-    """
-    하나의 클러스터로부터 Strip 배치 계획을 수립합니다.
-
-    [Strip Packing Phase 2 — Planning]
-    - Strip 폭: 클러스터 내 최대 W값 (+ 여유 없음, Kerf는 분리 시 처리)
-    - Strip 길이: node.dims.l (원장 전체 길이 방향)
-    - 내부 배치: 클러스터 부품을 길이(L) 내림차순으로 순차 배치
-    - 효율 추정: Σ(부품 면적) / Strip 면적
-
-    Returns:
-        StripPlan 또는 None (비효율적이거나 배치 불가)
-    """
+    """하나의 폭 클러스터로부터 Strip 배치 계획을 수립합니다."""
     if len(cluster) < STRIP_MIN_PARTS:
         return None
-
-    # Strip 폭 = 클러스터 내 최대 W
-    strip_w = max(orientation.w for _, orientation in cluster)
-
-    # 노드의 W가 Strip 폭보다 작으면 불가
-    if strip_w > node.dims.w + 1e-6:
+    strip_w = max(d.w for _, d in cluster)
+    if strip_w > node.dims.w + EPSILON:
         return None
 
-    # 중복 제거: 동일 part_id는 남은 수량만큼만
-    # cluster에는 allowed_orientations 전부 들어 있으므로
-    # part_id별로 가장 L이 긴 방향 하나만 선택
-    seen_part: Dict[str, Dims] = {}
-    for part, orientation in cluster:
+    seen: Dict[str, Tuple[Part, Dims]] = {}
+    for part, d in cluster:
         pid = part.id
-        if pid not in seen_part or orientation.l > seen_part[pid].l:
-            seen_part[pid] = orientation
+        if pid not in seen or d.l > seen[pid][1].l:
+            seen[pid] = (part, d)
 
-    # 배치 순서: L 내림차순 (긴 것 먼저 — 남은 공간에 짧은 것이 더 잘 맞음)
-    ordered: List[Tuple[Part, Dims]] = sorted(
-        [(parts_by_id_ref[pid], dims) for pid, dims in seen_part.items()
-         if remaining_parts.get(pid, 0) > 0],
+    ordered = sorted(
+        [(p, d) for pid, (p, d) in seen.items() if remaining_parts.get(pid, 0) > 0],
         key=lambda x: -x[1].l,
     )
-    # parts_by_id_ref는 호출 시점에 주입 — 클로저 대신 파라미터로 받음
-    # (아래 _plan_strip_with_parts 함수에서 처리)
-
     if not ordered:
         return None
 
-    # Strip 내 순차 배치 시뮬레이션
-    cursor_l = 0.0
-    strip_l = node.dims.l
+    cursor_l, strip_l = 0.0, node.dims.l
     parts_seq: List[Tuple[Part, Dims]] = []
-    total_part_area = 0.0
+    total_area = 0.0
 
-    for part, orientation in ordered:
-        qty_left = remaining_parts.get(part.id, 0)
-        placed_count = 0
-        for _ in range(qty_left):
-            needed_l = orientation.l
-            if cursor_l + needed_l > strip_l + 1e-6:
-                break  # 이 Strip에 더 이상 안 들어감
-            parts_seq.append((part, orientation))
-            cursor_l += needed_l + kerf
-            placed_count += 1
-            total_part_area += orientation.l * orientation.w
+    for part, d in ordered:
+        for _ in range(remaining_parts.get(part.id, 0)):
+            if cursor_l + d.l > strip_l + EPSILON:
+                break
+            parts_seq.append((part, d))
+            cursor_l += d.l + kerf
+            total_area += d.l * d.w
 
     if not parts_seq:
         return None
 
-    strip_area = strip_l * strip_w
-    efficiency = total_part_area / strip_area if strip_area > 0 else 0.0
-
-    if efficiency < STRIP_MIN_EFFICIENCY:
+    eff = total_area / (strip_l * strip_w) if strip_w > 0 else 0.0
+    min_eff = STRIP_MIN_EFF_2D if mode == PackingMode.FLAT_2D else STRIP_MIN_EFF_3D
+    if eff < min_eff:
         return None
 
-    return StripPlan(
-        strip_width=strip_w,
-        strip_axis=CutAxis.Y,
-        parts_seq=parts_seq,
-        efficiency=efficiency,
-    )
-
-
-def _plan_strip_with_parts(
-    cluster: List[Tuple[Part, Dims]],
-    node: Node,
-    remaining_parts: dict[str, int],
-    parts_by_id: dict[str, Part],
-    kerf: float,
-) -> Optional[StripPlan]:
-    """
-    parts_by_id를 외부에서 주입하여 _plan_strip을 실행하는 래퍼.
-    (모듈 수준 전역 참조 없이 순수 함수 구조 유지)
-    """
-    global parts_by_id_ref
-    parts_by_id_ref = parts_by_id
-    return _plan_strip(cluster, node, remaining_parts, kerf)
-
-
-# 모듈 수준 임시 참조 (순수 함수화 한계를 최소 범위로 처리)
-parts_by_id_ref: dict[str, Part] = {}
+    return StripPlan(strip_width=strip_w, strip_axis=CutAxis.Y,
+                     parts_seq=parts_seq, efficiency=eff)
 
 
 def _execute_strip_plan(
@@ -531,115 +495,126 @@ def _execute_strip_plan(
     plan: StripPlan,
     remaining_parts: dict[str, int],
     kerf: float,
+    mode: PackingMode,
+    heap: NodeHeap,
+    failures: List[PlacementFailure],
+    stock_id: str,
 ) -> Tuple[List[Node], Optional[Node]]:
     """
-    Strip 계획을 실제로 실행합니다.
+    Strip 계획 실행 — Z축 잔재 즉시 회수 포함.
 
-    [Strip Packing Phase 3 — Execution]
-    실행 순서:
-      1. node를 Y축으로 strip_width만큼 절단
-         → strip_node (l, strip_w, t)  — Strip 영역
-         → residual_node (l, W-strip_w-k, t)  — 나머지 큰 잔재
-      2. strip_node 내에서 부품을 X축(길이) 방향으로 순차 절단 배치
-      3. Strip 내 남은 공간은 FREE로 heap에 반환
-
-    Returns:
-        (occupied_list, residual_node)
-        residual_node는 Strip 바깥의 잔재 (None이면 딱 맞게 채워진 것)
+    Step 1: Y 방향으로 strip_width 절단
+            → strip_node + residual_node
+    Step 2: ★ strip_node의 Z 잔재 즉시 회수
+            max_part_t 계산 → _reclaim_z_slack(strip_node, max_part_t, kerf, heap)
+            child_b(Z 잔재)가 즉시 heap.push()됨
+    Step 3: X 방향 순차 배치
     """
     occupied_list: List[Node] = []
 
-    # ── Step 1: Strip 분리 절단 ───────────────────────────────────
+    # ── Step 1: Y 방향 Strip 분리 ────────────────────────────────
     strip_w = plan.strip_width
-
-    # Strip과 원장 W가 거의 같으면 별도 절단 불필요
-    if abs(node.dims.w - strip_w) < 1e-6:
-        strip_node = node
-        residual_node = None
+    if abs(node.dims.w - strip_w) < EPSILON:
+        strip_node: Node = node
+        residual_node: Optional[Node] = None
     else:
-        remainder_w = node.dims.w - strip_w - kerf
-        if remainder_w <= 0:
-            # Kerf 때문에 잔재가 없어지는 경우 → Strip 전체 사용
-            strip_node = node
-            residual_node = None
+        rem_w = node.dims.w - strip_w - kerf
+        if rem_w <= EPSILON:
+            strip_node = node; residual_node = None
         else:
             try:
                 strip_node, residual_node = split_node(node, CutAxis.Y, strip_w, kerf)
-            except InvalidCutError:
+            except InvalidCutError as exc:
+                failures.append(PlacementFailure(
+                    part_id="[strip]", stock_id=stock_id,
+                    reason=FailureReason.KERF_REMAINDER_ZERO,
+                    detail=f"Strip Y 분리 실패: {exc}",
+                ))
                 return [], None
 
-    # ── Step 2: Strip 내부 순차 배치 (X축 방향) ──────────────────
-    current_strip = strip_node  # 현재 작업 공간 (점점 잘려나감)
+    # ── Step 2: ★ Z축 잔재 즉시 회수 (요구사항 1) ────────────────
+    if plan.parts_seq:
+        max_part_t = max(d.t for _, d in plan.parts_seq)
+        # strip_node.T > max_part_t + kerf 이면 Z 분리
+        # child_b(Z 잔재)는 _reclaim_z_slack 내에서 heap.push()됨
+        strip_node = _reclaim_z_slack(strip_node, max_part_t, kerf, heap)
 
+    # ── Step 3: X 방향 순차 배치 ─────────────────────────────────
+    current = strip_node
     for part, orientation in plan.parts_seq:
         if remaining_parts.get(part.id, 0) <= 0:
             continue
-
-        # 현재 strip 공간에 이 부품이 들어가는지 재확인
         if (
-            orientation.l > current_strip.dims.l + 1e-6
-            or orientation.w > current_strip.dims.w + 1e-6
-            or orientation.t > current_strip.dims.t + 1e-6
+            orientation.l > current.dims.l + EPSILON
+            or orientation.w > current.dims.w + EPSILON
+            or orientation.t > current.dims.t + EPSILON
         ):
+            failures.append(PlacementFailure(
+                part_id=part.id, stock_id=stock_id,
+                reason=FailureReason.DIMENSION_EXCEEDS_NODE,
+                detail=(
+                    f"Strip 내부 — "
+                    f"부품({orientation.l:.1f}×{orientation.w:.1f}×{orientation.t:.1f})"
+                    f" > 노드({current.dims.l:.1f}×{current.dims.w:.1f}×{current.dims.t:.1f})"
+                ),
+            ))
             continue
 
-        # Best-Area Fit으로 절단 순서 결정
-        order_result = _best_cut_order(current_strip, orientation, kerf)
+        order_result = _best_cut_order(current, orientation, kerf, mode)
         if order_result is None:
+            failures.append(PlacementFailure(
+                part_id=part.id, stock_id=stock_id,
+                reason=FailureReason.KERF_REMAINDER_ZERO,
+                detail=(
+                    f"Strip 절단 순서 없음 — "
+                    f"부품({orientation.l:.1f}×{orientation.w:.1f}×{orientation.t:.1f}), "
+                    f"kerf={kerf:.1f}"
+                ),
+            ))
             continue
 
         best_order, _ = order_result
-
         try:
             occupied = _place_part_on_node(
-                node=current_strip,
-                part=part,
-                part_dims=orientation,
-                cut_order=best_order,
-                kerf=kerf,
+                node=current, part=part, part_dims=orientation,
+                cut_order=best_order, kerf=kerf,
             )
-        except InvalidCutError:
+        except InvalidCutError as exc:
+            failures.append(PlacementFailure(
+                part_id=part.id, stock_id=stock_id,
+                reason=FailureReason.KERF_REMAINDER_ZERO,
+                detail=f"split_node 오류: {exc}",
+            ))
             continue
 
         occupied_list.append(occupied)
         remaining_parts[part.id] -= 1
 
-        # 배치 후 남은 X 방향 잔재를 다음 current_strip으로
-        # (split_node가 child_b를 생성했으므로 부모 체인에서 찾기)
-        next_strip = _find_strip_remainder(occupied, strip_node)
-        if next_strip is None:
-            break  # Strip 소진
-        current_strip = next_strip
+        nxt = _find_strip_remainder(occupied, strip_node)
+        if nxt is None:
+            break
+        current = nxt
 
     return occupied_list, residual_node
 
 
 def _find_strip_remainder(occupied: Node, strip_root: Node) -> Optional[Node]:
-    """
-    Strip 내 배치 후 X 방향으로 남은 FREE 잔재 노드를 찾습니다.
-
-    occupied의 부모 체인을 역추적하여 strip_root 범위 내에서
-    가장 큰 FREE child_b (X 방향 잔재)를 반환합니다.
-    """
-    current: Optional[Node] = occupied
+    """Strip 배치 후 X 방향 FREE 잔재 노드를 반환합니다."""
+    cur: Optional[Node] = occupied
     steps = 0
-
-    while current is not None and steps <= 3:
-        parent = current.parent
+    while cur is not None and steps <= 3:
+        parent = cur.parent
         if parent is None:
             break
         cb = parent.child_b
         if cb is not None and cb.state == NodeState.FREE:
-            # X 방향 잔재인지 확인 (L이 클수록 Strip 내부 잔재)
             return cb
-        current = parent
-        steps += 1
-
+        cur = parent; steps += 1
     return None
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6. Best-Fit 후보 평가 — 공간 중심 탐색 (v1 유지 + 면적 기준 개선)
+# 8. Best-Fit 후보 평가 (요구사항 2 점수 + 요구사항 4 에러)
 # ══════════════════════════════════════════════════════════════════
 
 def _find_best_candidate(
@@ -647,58 +622,119 @@ def _find_best_candidate(
     remaining_parts: dict[str, int],
     parts_by_id: dict[str, Part],
     kerf: float,
+    mode: PackingMode,
+    failures: List[PlacementFailure],
+    stock_id: str,
 ) -> Optional[PlacementCandidate]:
     """
-    하나의 FREE 노드에 배치할 수 있는 모든 (part × orientation) 조합을 평가하고
-    Best-Area Fit 점수가 가장 좋은 PlacementCandidate를 반환합니다.
+    하나의 FREE 노드에 대한 최선의 PlacementCandidate를 반환합니다.
 
-    [v2 개선] score = node.XY_area - part_dims.XY_area (면적 기준)
-    → 두께(Z)가 얇은 판재가 지배적인 현실에서 더 정확한 낭비 지표
+    [요구사항 2] 모드별 점수:
+        FLAT_2D  → score = node.XY_area  - part.XY_area
+        SOLID_3D → score = node.volume   - part.volume
+
+    [요구사항 4] 실패 원인 구체화:
+        치수 초과 → 어느 축(L/W/T)이 얼마나 초과했는지 수치 명시
+        Kerf 잔재 없음 → 부품·노드 치수와 kerf 값 함께 기록
     """
     best: Optional[PlacementCandidate] = None
-    node_area = node.dims.l * node.dims.w  # XY 단면적
+    node_xy  = node.dims.l * node.dims.w
+    node_vol = node.dims.l * node.dims.w * node.dims.t
 
     for part_id, qty in remaining_parts.items():
         if qty <= 0:
             continue
-
         part = parts_by_id[part_id]
+        first_dim_fail_recorded = False
 
         for orientation in part.allowed_orientations():
-            if (
-                orientation.l > node.dims.l + 1e-6
-                or orientation.w > node.dims.w + 1e-6
-                or orientation.t > node.dims.t + 1e-6
-            ):
+            over = []
+            if orientation.l > node.dims.l + EPSILON:
+                over.append(f"L({orientation.l:.1f}>{node.dims.l:.1f})")
+            if orientation.w > node.dims.w + EPSILON:
+                over.append(f"W({orientation.w:.1f}>{node.dims.w:.1f})")
+            if orientation.t > node.dims.t + EPSILON:
+                over.append(f"T({orientation.t:.1f}>{node.dims.t:.1f})")
+
+            if over:
+                if not first_dim_fail_recorded:
+                    failures.append(PlacementFailure(
+                        part_id=part_id, stock_id=stock_id,
+                        reason=FailureReason.DIMENSION_EXCEEDS_NODE,
+                        detail="초과 축: " + ", ".join(over),
+                    ))
+                    first_dim_fail_recorded = True
                 continue
 
-            order_result = _best_cut_order(node, orientation, kerf)
+            order_result = _best_cut_order(node, orientation, kerf, mode)
             if order_result is None:
+                failures.append(PlacementFailure(
+                    part_id=part_id, stock_id=stock_id,
+                    reason=FailureReason.KERF_REMAINDER_ZERO,
+                    detail=(
+                        f"부품({orientation.l:.1f}×{orientation.w:.1f}×{orientation.t:.1f}), "
+                        f"노드({node.dims.l:.1f}×{node.dims.w:.1f}×{node.dims.t:.1f}), "
+                        f"kerf={kerf:.1f}"
+                    ),
+                ))
                 continue
 
-            best_order, max_offcut_area = order_result
+            best_order, max_offcut = order_result
+            if mode == PackingMode.FLAT_2D:
+                score = node_xy  - orientation.l * orientation.w
+            else:
+                score = node_vol - orientation.l * orientation.w * orientation.t
 
-            # [v2] XY 면적 기준 Best-Area Fit score
-            part_area = orientation.l * orientation.w
-            score = node_area - part_area
-
-            candidate = PlacementCandidate(
-                score=score,
-                max_offcut=max_offcut_area,
-                node=node,
-                part=part,
-                part_dims=orientation,
-                cut_order=best_order,
+            cand = PlacementCandidate(
+                score=score, max_offcut=max_offcut,
+                node=node, part=part, part_dims=orientation, cut_order=best_order,
             )
-
-            if best is None or candidate < best:
-                best = candidate
+            if best is None or cand < best:
+                best = cand
 
     return best
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. 단일 Stock 처리 루프 (v2 — Strip Phase 우선)
+# 9. 자유 노드 수집 유틸리티
+# ══════════════════════════════════════════════════════════════════
+
+def _collect_free_nodes(node: Node, heap: NodeHeap) -> None:
+    """서브트리의 모든 FREE 노드를 heap에 등록합니다 (Z 회수 노드 포함)."""
+    stack: list[Node] = [node]
+    visited: set[str] = set()
+    while stack:
+        cur = stack.pop()
+        if cur.node_id in visited:
+            continue
+        visited.add(cur.node_id)
+        if cur.state == NodeState.FREE:
+            heap.push(cur)
+        elif cur.state == NodeState.SPLIT:
+            if cur.child_a: stack.append(cur.child_a)
+            if cur.child_b: stack.append(cur.child_b)
+
+
+def _register_new_free_nodes(occupied: Node, heap: NodeHeap) -> None:
+    """
+    occupied 노드의 부모 체인을 역추적하여 FREE child_b들을 heap에 등록합니다.
+    Z 방향 child_b(FREE 잔재 ③)도 여기서 자동 등록됩니다.
+    """
+    cur: Optional[Node] = occupied
+    steps = 0
+    while cur is not None and steps <= 3:
+        parent = cur.parent
+        if parent is None:
+            break
+        if parent.state == NodeState.SPLIT:
+            cb = parent.child_b
+            if cb is not None and cb.state == NodeState.FREE:
+                heap.push(cb)
+        cur = parent; steps += 1
+
+
+# ══════════════════════════════════════════════════════════════════
+# 10. 단일 Stock 처리 루프 (2-Phase Hybrid)
 # ══════════════════════════════════════════════════════════════════
 
 def _pack_single_stock(
@@ -706,282 +742,309 @@ def _pack_single_stock(
     remaining_parts: dict[str, int],
     parts_by_id: dict[str, Part],
     kerf: float,
+    mode: PackingMode,
+    failures: List[PlacementFailure],
+    stock_id: str,
 ) -> List[Node]:
     """
-    하나의 원장(root Node)에 대해 Strip Packing 우선, Fallback Best-Fit 순으로 탐색합니다.
+    하나의 원장에 대해 2-Phase Hybrid Packing을 수행합니다.
 
-    [v2 2-Phase 전략]
-    Phase 1 — Strip Packing:
-      원장 루트 노드에서 폭 클러스터를 분석하고,
-      효율적인 Strip이 존재하면 Strip 배치를 먼저 수행합니다.
-      Strip 배치 후 남은 잔재 노드들은 heap에 등록됩니다.
+    Phase 1 — Strip Packing + Z 잔재 즉시 회수:
+      클러스터링 → 계획 → 실행(_execute_strip_plan)
+      _execute_strip_plan 내에서 _reclaim_z_slack이 Z child_b를 heap.push()
 
-    Phase 2 — Fallback Best-Fit:
-      Strip으로 처리되지 않은 부품들과 잔재 공간을
-      기존 v1 방식(Best-Area Fit + Max-Offcut)으로 처리합니다.
+    Phase 2 — Fallback Best-Fit (Hybrid 점수):
+      heap 기반 탐색, 모드별 점수, Z 잔재 추가 회수
     """
     heap = NodeHeap()
     heap.push(root)
-
-    occupied_nodes: List[Node] = []
+    occupied: List[Node] = []
 
     # ── Phase 1: Strip Packing ────────────────────────────────────
-    # 루트 노드(가장 큰 공간)에서만 Strip 계획 수립
-    strip_attempted = False
-    if not strip_attempted:
-        strip_attempted = True
-        clusters = _cluster_parts_by_width(remaining_parts, parts_by_id, root, kerf)
-
+    if root.state == NodeState.FREE:
+        clusters = _cluster_parts_by_width(remaining_parts, parts_by_id, root)
         for cluster in clusters:
             if all(q <= 0 for q in remaining_parts.values()):
                 break
-
-            plan = _plan_strip_with_parts(cluster, root, remaining_parts, parts_by_id, kerf)
-            if plan is None:
-                continue
-
-            # root가 아직 FREE인지 확인
             if root.state != NodeState.FREE:
                 break
-
-            strip_occupied, residual = _execute_strip_plan(root, plan, remaining_parts, kerf)
-            occupied_nodes.extend(strip_occupied)
-
-            # Strip 후 남은 잔재(residual)와 Strip 내 미사용 공간을 heap에 등록
+            plan = _plan_strip(cluster, root, remaining_parts, parts_by_id, kerf, mode)
+            if plan is None:
+                continue
+            strip_occ, residual = _execute_strip_plan(
+                node=root, plan=plan, remaining_parts=remaining_parts,
+                kerf=kerf, mode=mode, heap=heap,
+                failures=failures, stock_id=stock_id,
+            )
+            occupied.extend(strip_occ)
             if residual is not None and residual.state == NodeState.FREE:
                 heap.push(residual)
-
-            # Strip 내 미사용 공간도 heap에 등록
-            _collect_free_nodes_from(root, heap)
-
-            # 첫 번째 성공한 Strip 이후 heap 기반 Fallback으로 전환
-            break
+            _collect_free_nodes(root, heap)  # Z 회수 노드 포함 전체 수집
+            break  # 첫 Strip 성공 → Phase 2로 전환
 
     # ── Phase 2: Fallback Best-Fit ────────────────────────────────
     while True:
         if all(q <= 0 for q in remaining_parts.values()):
             break
-
         node = heap.pop()
         if node is None:
             break
 
-        candidate = _find_best_candidate(node, remaining_parts, parts_by_id, kerf)
+        # Fallback에서도 Z 잔재 회수 (요구사항 1 완전성)
+        min_t = min(
+            (parts_by_id[pid].dims.t for pid, q in remaining_parts.items() if q > 0),
+            default=None,
+        )
+        if min_t is not None and node.dims.t > min_t + kerf + EPSILON:
+            node = _reclaim_z_slack(node, min_t, kerf, heap)
 
-        if candidate is None:
+        cand = _find_best_candidate(
+            node=node, remaining_parts=remaining_parts, parts_by_id=parts_by_id,
+            kerf=kerf, mode=mode, failures=failures, stock_id=stock_id,
+        )
+        if cand is None:
             node.state = NodeState.DISCARDED
             continue
 
         try:
-            occupied = _place_part_on_node(
-                node=candidate.node,
-                part=candidate.part,
-                part_dims=candidate.part_dims,
-                cut_order=candidate.cut_order,
-                kerf=kerf,
+            occ = _place_part_on_node(
+                node=cand.node, part=cand.part, part_dims=cand.part_dims,
+                cut_order=cand.cut_order, kerf=kerf,
             )
-        except InvalidCutError:
+        except InvalidCutError as exc:
             node.state = NodeState.DISCARDED
+            failures.append(PlacementFailure(
+                part_id=cand.part.id, stock_id=stock_id,
+                reason=FailureReason.KERF_REMAINDER_ZERO,
+                detail=f"_place_part_on_node: {exc}",
+            ))
             continue
 
-        occupied_nodes.append(occupied)
-        remaining_parts[candidate.part.id] -= 1
-        _register_new_free_nodes(occupied, heap)
+        occupied.append(occ)
+        remaining_parts[cand.part.id] -= 1
+        _register_new_free_nodes(occ, heap)
 
-    return occupied_nodes
-
-
-def _collect_free_nodes_from(node: Node, heap: NodeHeap) -> None:
-    """
-    주어진 노드의 서브트리에서 FREE 상태인 노드를 모두 찾아 heap에 등록합니다.
-    Strip 실행 후 내부 잔재 공간을 수집할 때 사용합니다.
-    """
-    stack = [node]
-    visited: set[str] = set()
-
-    while stack:
-        current = stack.pop()
-        if current.node_id in visited:
-            continue
-        visited.add(current.node_id)
-
-        if current.state == NodeState.FREE:
-            heap.push(current)
-        elif current.state == NodeState.SPLIT:
-            if current.child_a is not None:
-                stack.append(current.child_a)
-            if current.child_b is not None:
-                stack.append(current.child_b)
-
-
-def _register_new_free_nodes(occupied: Node, heap: NodeHeap) -> None:
-    """
-    배치가 완료된 occupied 노드로부터 부모 체인을 역추적하여
-    새로 생성된 FREE child_b 노드들을 heap에 등록합니다.
-    """
-    current: Optional[Node] = occupied
-    steps = 0
-    max_steps = 3
-
-    while current is not None and steps <= max_steps:
-        parent = current.parent
-        if parent is None:
-            break
-        if parent.state == NodeState.SPLIT:
-            cb = parent.child_b
-            if cb is not None and cb.state == NodeState.FREE:
-                heap.push(cb)
-        current = parent
-        steps += 1
+    return occupied
 
 
 # ══════════════════════════════════════════════════════════════════
-# 8. Part 정렬 전략 (v2 — 면적 + 부피 복합 기준)
+# 11. 원장 중심 좌표 계산 (요구사항 3)
 # ══════════════════════════════════════════════════════════════════
 
-def _sort_parts_for_packing(parts: List[Part]) -> List[Part]:
+def _compute_stock_center(stock: Stock, trimming: object = None) -> StockCenter:
     """
-    초기 배치 효율을 높이기 위한 Part 정렬.
+    원장 기하학적 정중앙 좌표를 계산합니다 (요구사항 3).
 
-    [v2 개선] 부피 단일 기준 → (면적, 부피) 복합 기준
-    - 1차: XY 면적 내림차순 (넓은 것 먼저 → Strip 그룹화 유리)
-    - 2차: 부피 내림차순 (두꺼운 것 우선)
-    - 3차: priority 내림차순, id 오름차순 (결정론적)
+    trimming 적용 후 usable 영역의 중심:
+        cx = trim_x + (stock.l - 2*trim_x) / 2
+        cy = trim_y + (stock.w - 2*trim_y) / 2
+        cz = trim_z + (stock.t - 2*trim_z) / 2
+
+    App.jsx buildSceneData()의 stockCenter 계산과 동일한 로직으로
+    OrbitControls.target과 정확히 일치합니다.
     """
-    return sorted(
-        parts,
-        key=lambda p: (-(p.dims.l * p.dims.w), -p.dims.volume, -p.priority, p.id),
+    def _get(key: str) -> float:
+        if trimming is None: return 0.0
+        if isinstance(trimming, dict): return float(trimming.get(key, 0.0))
+        return float(getattr(trimming, key, 0.0))
+
+    tx, ty, tz = _get("x"), _get("y"), _get("z")
+    ul = max(0.0, stock.dims.l - 2 * tx)
+    uw = max(0.0, stock.dims.w - 2 * ty)
+    ut = max(0.0, stock.dims.t - 2 * tz)
+
+    return StockCenter(
+        stock_id=stock.id,
+        cx=tx + ul / 2.0,
+        cy=ty + uw / 2.0,
+        cz=tz + ut / 2.0,
     )
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9. 메인 공개 함수
+# 12. Part 정렬 전략 (모드별)
+# ══════════════════════════════════════════════════════════════════
+
+def _sort_parts(parts: List[Part], mode: PackingMode) -> List[Part]:
+    """
+    FLAT_2D  → XY 면적 내림차순 → 두께 내림차순 → priority → id
+    SOLID_3D → 부피 내림차순   → XY 면적 내림차순 → priority → id
+    """
+    if mode == PackingMode.FLAT_2D:
+        key = lambda p: (-(p.dims.l * p.dims.w), -p.dims.t, -p.priority, p.id)
+    else:
+        key = lambda p: (-p.dims.volume, -(p.dims.l * p.dims.w), -p.priority, p.id)
+    return sorted(parts, key=key)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 13. 메인 공개 함수
 # ══════════════════════════════════════════════════════════════════
 
 def pack_parts(
     settings: EngineSettings,
     stocks: List[Stock],
     parts: List[Part],
-) -> List[Node]:
+) -> PackResult:
     """
-    3D Guillotine Heuristic Packer v2 — 메인 진입점.
+    3D Guillotine Heuristic Packer v3 — 메인 진입점.
 
-    알고리즘 개요 (v2):
-      1. Parts를 (면적, 부피) 복합 기준 내림차순 정렬
-      2. Stock을 순서대로 처리
-         a. 각 Stock에서 create_root_node()로 루트 노드 생성 (trimming 적용)
-         b. [신규] Phase 1 — Strip Packing:
-              폭 기준 클러스터링 → Strip 효율 추정 → Strip 배치 실행
-         c. Phase 2 — Fallback Best-Area Fit:
-              NodeHeap 기반 공간 중심 탐색 (v1 방식 + 면적 기준 개선)
-      3. 모든 Part 배치 완료 또는 Stock 소진 시 종료
+    반환값: PackResult
+        .occupied      : OCCUPIED 노드 목록
+        .failures      : PlacementFailure 목록 (구체적 원인, 요구사항 4)
+        .stock_centers : StockCenter 목록 (카메라 타겟, 요구사항 3)
+        .mode          : PackingMode (자동 감지, 요구사항 2)
+        .unplaced      : {part_id: 잔여 수량}
 
-    Args:
-        settings: kerf, trimming, optimization_goal 등 전역 설정
-        stocks  : 사용 가능한 원장 목록
-        parts   : 배치해야 할 부품 목록
-
-    Returns:
-        배치된 OCCUPIED 노드 목록
+    FastAPI 직렬화 예시:
+        result = pack_parts(settings, stocks, parts)
+        response["failures"]      = [f.to_dict() for f in result.failures]
+        response["stock_centers"] = [c.to_dict() for c in result.stock_centers]
+        response["mode"]          = result.mode.value
     """
     if not parts:
-        return []
+        return PackResult(occupied=[], failures=[], stock_centers=[],
+                          mode=PackingMode.FLAT_2D, unplaced={})
     if not stocks:
-        return []
+        return PackResult(
+            occupied=[], stock_centers=[], mode=PackingMode.FLAT_2D,
+            failures=[PlacementFailure(
+                part_id=p.id, stock_id="N/A",
+                reason=FailureReason.STOCK_EXHAUSTED,
+                detail="사용 가능한 원장이 없습니다.",
+            ) for p in parts],
+            unplaced={p.id: p.qty for p in parts},
+        )
 
-    # ── 초기화 ─────────────────────────────────────────────────────
-    sorted_parts = _sort_parts_for_packing(parts)
-    parts_by_id: dict[str, Part] = {p.id: p for p in sorted_parts}
+    # 모드 자동 감지 (요구사항 2)
+    mode = _detect_mode(parts)
+    sorted_parts  = _sort_parts(parts, mode)
+    parts_by_id   = {p.id: p for p in sorted_parts}
+    remaining     = {p.id: p.qty for p in sorted_parts}
+    all_occupied: List[Node]            = []
+    all_failures: List[PlacementFailure] = []
+    centers:      List[StockCenter]      = []
+    kerf     = settings.kerf
+    trimming = getattr(settings, "trimming", None)
 
-    # 잔여 수량 추적
-    remaining_parts: dict[str, int] = {p.id: p.qty for p in sorted_parts}
-
-    all_occupied: List[Node] = []
-    kerf = settings.kerf
-
-    # ── Stock 순서 처리 ───────────────────────────────────────────
     for stock in stocks:
-        for _copy_idx in range(stock.qty):
-            if all(q <= 0 for q in remaining_parts.values()):
+        base_center = _compute_stock_center(stock, trimming)
+
+        for copy_idx in range(stock.qty):
+            if all(q <= 0 for q in remaining.values()):
                 break
 
-            unique_stock_id = f"{stock.id}-{_copy_idx + 1}"
+            uid = f"{stock.id}-{copy_idx + 1}"
+            centers.append(StockCenter(
+                stock_id=uid, cx=base_center.cx, cy=base_center.cy, cz=base_center.cz,
+            ))
+
+            # trimming 사전 검증 (요구사항 4)
+            def _get(key: str) -> float:
+                if trimming is None: return 0.0
+                if isinstance(trimming, dict): return float(trimming.get(key, 0.0))
+                return float(getattr(trimming, key, 0.0))
+            tx, ty, tz = _get("x"), _get("y"), _get("z")
+            eff_l = stock.dims.l - 2 * tx
+            eff_w = stock.dims.w - 2 * ty
+            eff_t = stock.dims.t - 2 * tz
+
+            for pid, qty in remaining.items():
+                if qty <= 0: continue
+                p = parts_by_id[pid]
+                if not any(
+                    o.l <= eff_l + EPSILON and o.w <= eff_w + EPSILON and o.t <= eff_t + EPSILON
+                    for o in p.allowed_orientations()
+                ):
+                    all_failures.append(PlacementFailure(
+                        part_id=pid, stock_id=uid,
+                        reason=FailureReason.TRIMMING_TOO_LARGE,
+                        detail=(
+                            f"유효 영역({eff_l:.1f}×{eff_w:.1f}×{eff_t:.1f})"
+                            f" < 부품({p.dims.l:.1f}×{p.dims.w:.1f}×{p.dims.t:.1f}), "
+                            f"trimming=({tx:.1f},{ty:.1f},{tz:.1f})"
+                        ),
+                    ))
 
             root = create_root_node(stock)
-            root.stock_id = unique_stock_id
-
-            occupied = _pack_single_stock(
-                root=root,
-                remaining_parts=remaining_parts,
-                parts_by_id=parts_by_id,
-                kerf=kerf,
+            root.stock_id = uid
+            occ = _pack_single_stock(
+                root=root, remaining_parts=remaining, parts_by_id=parts_by_id,
+                kerf=kerf, mode=mode, failures=all_failures, stock_id=uid,
             )
-            all_occupied.extend(occupied)
+            all_occupied.extend(occ)
 
-        if all(q <= 0 for q in remaining_parts.values()):
+        if all(q <= 0 for q in remaining.values()):
             break
 
-    # ── 미배치 Part 경고 출력 ────────────────────────────────────
-    unplaced = {pid: qty for pid, qty in remaining_parts.items() if qty > 0}
+    unplaced = {pid: qty for pid, qty in remaining.items() if qty > 0}
+    for pid, qty in unplaced.items():
+        all_failures.append(PlacementFailure(
+            part_id=pid, stock_id="ALL",
+            reason=FailureReason.STOCK_EXHAUSTED,
+            detail=f"잔여 {qty}개 — 모든 원장 소진 후에도 배치 불가",
+        ))
+
     if unplaced:
-        import warnings
         warnings.warn(
-            f"[Packer] 배치되지 못한 Part가 있습니다: {unplaced}\n"
-            "Stock 수량 또는 크기를 확인하세요.",
+            f"[Packer v3] 미배치 Part: {unplaced} | failures 목록에서 원인 확인",
             stacklevel=2,
         )
 
-    return all_occupied
+    return PackResult(
+        occupied=all_occupied, failures=all_failures,
+        stock_centers=centers, mode=mode, unplaced=unplaced,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
-# 10. 결과 분석 유틸리티
+# 14. 결과 분석 유틸리티
 # ══════════════════════════════════════════════════════════════════
 
 @dataclass
 class PackingReport:
-    """
-    패킹 결과 요약 보고서.
-    디버깅 및 최적화 피드백 루프에 사용합니다.
-    """
+    """패킹 결과 요약 보고서."""
     total_part_volume:  float
     total_stock_volume: float
     placed_count:       int
-    unplaced:           dict[str, int]
-    efficiency_pct:     float   # = placed_volume / used_stock_volume × 100
+    unplaced:           Dict[str, int]
+    efficiency_pct:     float
     occupied_nodes:     List[Node]
+    mode:               PackingMode
+    failure_summary:    Dict[str, int]  # FailureReason.value → 횟수
 
     def __str__(self) -> str:
         lines = [
-            "─" * 50,
+            "─" * 56,
+            f"  패킹 모드:  {self.mode.value}",
             f"  배치 완료: {self.placed_count}개",
             f"  미배치:    {self.unplaced}",
-            f"  부품 부피: {self.total_part_volume:,.1f}",
-            f"  원장 부피: {self.total_stock_volume:,.1f}",
+            f"  부품 부피: {self.total_part_volume:,.1f} mm³",
+            f"  원장 부피: {self.total_stock_volume:,.1f} mm³",
             f"  효율:      {self.efficiency_pct:.1f}%",
-            "─" * 50,
         ]
+        if self.failure_summary:
+            lines.append("  실패 원인 분류:")
+            for reason, cnt in sorted(self.failure_summary.items(), key=lambda x: -x[1]):
+                lines.append(f"    [{cnt:>3}회] {reason}")
+        lines.append("─" * 56)
         return "\n".join(lines)
 
 
-def analyze_packing(
-    occupied_nodes: List[Node],
-    stocks_used: List[Stock],
-    remaining: dict[str, int],
-) -> PackingReport:
-    """OCCUPIED 노드 목록으로부터 패킹 효율 보고서를 생성합니다."""
+def analyze_packing(result: PackResult, stocks_used: List[Stock]) -> PackingReport:
+    """PackResult로부터 패킹 효율 보고서를 생성합니다."""
     placed_vol = sum(
-        n.placed_part_dims.volume for n in occupied_nodes
+        n.placed_part_dims.volume for n in result.occupied
         if n.placed_part_dims is not None
     )
-    stock_vol = sum(s.usable_volume * s.qty for s in stocks_used)
+    stock_vol  = sum(s.usable_volume * s.qty for s in stocks_used)
     efficiency = (placed_vol / stock_vol * 100) if stock_vol > 0 else 0.0
-
+    fail_summary: Dict[str, int] = defaultdict(int)
+    for f in result.failures:
+        fail_summary[f.reason.value] += 1
     return PackingReport(
-        total_part_volume=placed_vol,
-        total_stock_volume=stock_vol,
-        placed_count=len(occupied_nodes),
-        unplaced={pid: q for pid, q in remaining.items() if q > 0},
-        efficiency_pct=efficiency,
-        occupied_nodes=occupied_nodes,
+        total_part_volume=placed_vol, total_stock_volume=stock_vol,
+        placed_count=len(result.occupied), unplaced=result.unplaced,
+        efficiency_pct=efficiency, occupied_nodes=result.occupied,
+        mode=result.mode, failure_summary=dict(fail_summary),
     )
