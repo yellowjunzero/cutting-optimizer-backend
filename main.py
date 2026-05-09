@@ -17,7 +17,7 @@ class TrimmingIn(BaseModel):
     x: float = Field(default=0.0, ge=0); y: float = Field(default=0.0, ge=0); z: float = Field(default=0.0, ge=0)
 
 class SettingsIn(BaseModel):
-    kerf: float = Field(default=3.0, ge=0); trimming: TrimmingIn = Field(default_factory=TrimmingIn)
+    kerf: float = Field(default=5.0, ge=0); trimming: TrimmingIn = Field(default_factory=TrimmingIn)
     optimization_goal: str = Field(default="MINIMIZE_WASTE")
 
 class StockIn(BaseModel):
